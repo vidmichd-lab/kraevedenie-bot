@@ -38,4 +38,13 @@ class Database:
         subscribers = [row[0] for row in cursor.fetchall()]
         conn.close()
         return subscribers
+    
+    def get_all_subscribers_info(self):
+        """Возвращает полную информацию о всех подписчиках"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, username, subscribed_at FROM subscribers ORDER BY subscribed_at DESC')
+        subscribers = cursor.fetchall()
+        conn.close()
+        return subscribers
 
