@@ -103,10 +103,10 @@ jobs:
 
 ```bash
 # Проверьте, что токены не в истории
-git log --all --full-history -p | grep -i "8508993803"
+git log --all --full-history -p | grep -i "ваш_токен"
 
 # Проверьте текущие файлы
-grep -r "8508993803" .
+grep -r "TELEGRAM_BOT_TOKEN" . --exclude-dir=.git
 
 # Если ничего не найдено - отлично!
 ```
