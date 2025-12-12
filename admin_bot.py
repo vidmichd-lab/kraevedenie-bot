@@ -5,6 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from dotenv import load_dotenv
 from database import Database
+from security import SecurityManager
 
 load_dotenv()
 
@@ -14,8 +15,8 @@ class AdminBot:
         if not self.token:
             raise ValueError("ADMIN_BOT_TOKEN не найден в .env файле!")
         
-        # Список ID администраторов (добавьте свой Telegram ID)
-        self.admin_ids = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
+        # Инициализируем систему безопасности
+        self.security = SecurityManager()
         
         self.db = Database()
         self.load_events()
@@ -34,16 +35,11 @@ class AdminBot:
         with open('data/events.json', 'w', encoding='utf-8') as f:
             json.dump(self.events, f, ensure_ascii=False, indent=2)
     
-    def is_admin(self, user_id: int) -> bool:
-        """Проверяет, является ли пользователь администратором"""
-        return user_id in self.admin_ids
-    
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("❌ У вас нет доступа к админ-панели.")
+        has_access, error_msg = self.security.check_admin_access(update)
+        if not has_access:
+            await update.message.reply_text(f"❌ {error_msg}")
             return
         
         keyboard = [
@@ -64,10 +60,14 @@ class AdminBot:
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик нажатий на кнопки"""
         query = update.callback_query
-        user_id = query.from_user.id
         
-        if not self.is_admin(user_id):
-            await query.answer("❌ У вас нет доступа.", show_alert=True)
+        # Создаем временный Update для проверки доступа
+        temp_update = Update(update_id=update.update_id)
+        temp_update.effective_user = query.from_user
+        
+        has_access, error_msg = self.security.check_admin_access(temp_update)
+        if not has_access:
+            await query.answer(f"❌ {error_msg}", show_alert=True)
             return
         
         await query.answer()
@@ -211,10 +211,11 @@ class AdminBot:
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
+        has_access, error_msg = self.security.check_admin_access(update)
+        if not has_access:
             return
+        
+        user_id = update.effective_user.id
         
         if user_id not in self.pending_data:
             return
@@ -223,35 +224,47 @@ class AdminBot:
         text = update.message.text
         
         if step == 'date':
-            # Проверяем формат даты
-            try:
-                datetime.strptime(text, '%Y-%m-%d')
-                self.pending_data[user_id]['date'] = text
-                self.pending_data[user_id]['step'] = 'title'
-                await update.message.reply_text(
-                    f"✅ Дата: {text}\n\n"
-                    "Отправьте заголовок события:"
-                )
-            except ValueError:
+            # Валидация даты через систему безопасности
+            if not self.security.validate_date(text):
                 await update.message.reply_text(
                     "❌ Неверный формат даты!\n"
                     "Используйте формат: YYYY-MM-DD\n"
                     "Например: 2024-12-19"
                 )
+                return
+            
+            self.pending_data[user_id]['date'] = text
+            self.pending_data[user_id]['step'] = 'title'
+            await update.message.reply_text(
+                f"✅ Дата: {text}\n\n"
+                "Отправьте заголовок события:"
+            )
         
         elif step == 'title':
-            self.pending_data[user_id]['title'] = text
+            # Очистка и валидация заголовка
+            title = self.security.sanitize_text(text, max_length=200)
+            if not title:
+                await update.message.reply_text("❌ Заголовок не может быть пустым!")
+                return
+            
+            self.pending_data[user_id]['title'] = title
             self.pending_data[user_id]['step'] = 'description'
             await update.message.reply_text(
-                f"✅ Заголовок: {text}\n\n"
+                f"✅ Заголовок: {title}\n\n"
                 "Отправьте описание события:"
             )
         
         elif step == 'description':
-            self.pending_data[user_id]['description'] = text
+            # Очистка и валидация описания
+            description = self.security.sanitize_text(text, max_length=2000)
+            if not description:
+                await update.message.reply_text("❌ Описание не может быть пустым!")
+                return
+            
+            self.pending_data[user_id]['description'] = description
             self.pending_data[user_id]['step'] = 'image'
             await update.message.reply_text(
-                f"✅ Описание: {text}\n\n"
+                f"✅ Описание сохранено\n\n"
                 "Отправьте ссылку на картинку (или отправьте /skip чтобы пропустить):"
             )
         
@@ -259,6 +272,14 @@ class AdminBot:
             if text.lower() == '/skip':
                 self.pending_data[user_id]['image'] = None
             else:
+                # Валидация URL картинки
+                if not self.security.validate_url(text):
+                    await update.message.reply_text(
+                        "❌ Неверный формат ссылки!\n"
+                        "Используйте полную ссылку (http:// или https://)\n"
+                        "Или отправьте /skip чтобы пропустить"
+                    )
+                    return
                 self.pending_data[user_id]['image'] = text
             self.pending_data[user_id]['step'] = 'map'
             await update.message.reply_text(
@@ -269,6 +290,14 @@ class AdminBot:
             if text.lower() == '/skip':
                 self.pending_data[user_id]['map_url'] = None
             else:
+                # Валидация URL карты
+                if not self.security.validate_url(text):
+                    await update.message.reply_text(
+                        "❌ Неверный формат ссылки!\n"
+                        "Используйте полную ссылку (http:// или https://)\n"
+                        "Или отправьте /skip чтобы пропустить"
+                    )
+                    return
                 self.pending_data[user_id]['map_url'] = text
             
             # Сохраняем событие
@@ -329,10 +358,11 @@ class AdminBot:
     
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик фотографий"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
+        has_access, error_msg = self.security.check_admin_access(update)
+        if not has_access:
             return
+        
+        user_id = update.effective_user.id
         
         if user_id in self.pending_data and self.pending_data[user_id]['step'] == 'image':
             # Получаем file_id фотографии
